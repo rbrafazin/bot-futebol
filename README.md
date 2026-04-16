@@ -6,7 +6,7 @@ Bot de Telegram para consultar jogos de futebol do dia na ESPN e sugerir apostas
 
 - Consulta automática das ligas configuradas para a data atual.
 - Filtro apenas para jogos que ainda não começaram.
-- Sugestões de apostas em formato enxuto para Telegram.
+- Mercados de apostas ranqueados em formato enxuto para Telegram.
 - Botão inline para atualizar os palpites sem digitar comandos.
 - Token do Telegram carregado por variável de ambiente.
 

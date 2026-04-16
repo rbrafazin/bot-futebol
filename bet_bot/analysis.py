@@ -257,20 +257,24 @@ class SuggestionEngine:
         notes: str,
         odds_blob: str,
         odds_snapshot: dict[str, float | str | None],
-    ) -> tuple[tuple[BetOption, BetOption, BetOption], int, str]:
+    ) -> tuple[tuple[BetOption, ...], int, str]:
         home_strength = self._strength_score(home_record)
         away_strength = self._strength_score(away_record)
         strength_gap = home_strength - away_strength
         home_form = self._form_score(home_record)
         away_form = self._form_score(away_record)
+        draw_rate = self._average_draw_rate(home_record, away_record)
+        form_gap = abs(home_form - away_form)
         combined_context = f"{notes} | {odds_blob}".lower()
 
         favorite_side = odds_snapshot.get("favorite_side")
         favorite_gap = odds_snapshot.get("favorite_gap")
         home_win_probability = odds_snapshot.get("home_win_probability")
         away_win_probability = odds_snapshot.get("away_win_probability")
+        draw_probability = odds_snapshot.get("draw_probability")
         over_under = odds_snapshot.get("over_under")
         over_25_probability = odds_snapshot.get("over_25_probability")
+        under_25_probability = odds_snapshot.get("under_25_probability")
 
         over_25_signal = self._has_goal_signal(combined_context, "2.5")
         over_15_signal = self._has_goal_signal(combined_context, "1.5")
@@ -299,46 +303,65 @@ class SuggestionEngine:
 
         home_win_estimate = self._estimate_side_probability(home_win_probability, home_form)
         away_win_estimate = self._estimate_side_probability(away_win_probability, away_form)
-        over_25_estimate = self._estimate_over_25_probability(over_25_probability, over_under, over_25_signal)
-        over_15_estimate = self._estimate_over_15_probability(over_25_estimate, over_15_signal)
+        draw_estimate = self._estimate_draw_probability(
+            draw_probability=draw_probability,
+            equilibrium=equilibrium,
+            home_form=home_form,
+            away_form=away_form,
+            favorite_gap=favorite_gap,
+            draw_rate=draw_rate,
+        )
+        over_25_estimate = self._estimate_over_25_probability(
+            over_25_probability=over_25_probability,
+            over_under=over_under,
+            over_25_signal=over_25_signal,
+            equilibrium=equilibrium,
+            draw_rate=draw_rate,
+            strength_gap=strength_gap,
+        )
+        over_15_estimate = self._estimate_over_15_probability(
+            over_25_estimate=over_25_estimate,
+            over_15_signal=over_15_signal,
+            draw_rate=draw_rate,
+        )
+        under_25_estimate = self._estimate_under_probability(under_25_probability, over_25_estimate)
+        under_15_estimate = self._estimate_under_probability(None, over_15_estimate)
         btts_estimate = self._estimate_btts_probability(
             over_25_estimate=over_25_estimate,
             equilibrium=equilibrium,
             favorite_gap=favorite_gap,
             btts_signal=btts_signal,
+            draw_rate=draw_rate,
+            form_gap=form_gap,
         )
+        home_dnb_estimate = self._estimate_draw_no_bet_probability(home_win_estimate, away_win_estimate)
+        away_dnb_estimate = self._estimate_draw_no_bet_probability(away_win_estimate, home_win_estimate)
 
         scores = {
-            "Vitória Casa": self._to_percent(home_win_estimate),
-            "Vitória Visitante": self._to_percent(away_win_estimate),
+            "1 (Casa)": self._to_percent(home_win_estimate),
+            "X (Empate)": self._to_percent(draw_estimate),
+            "2 (Visitante)": self._to_percent(away_win_estimate),
             "Over 1.5": self._to_percent(over_15_estimate),
+            "Under 1.5": self._to_percent(under_15_estimate),
             "Over 2.5": self._to_percent(over_25_estimate),
+            "Under 2.5": self._to_percent(under_25_estimate),
+            "Empate Anula Casa": self._to_percent(home_dnb_estimate),
+            "Empate Anula Visitante": self._to_percent(away_dnb_estimate),
             "Ambas Marcam": self._to_percent(btts_estimate),
         }
 
         if strength_gap >= 7:
-            scores["Vitória Casa"] = min(92, scores["Vitória Casa"] + 4)
+            scores["1 (Casa)"] = min(92, scores["1 (Casa)"] + 4)
+            scores["Empate Anula Casa"] = min(93, scores["Empate Anula Casa"] + 3)
         elif strength_gap <= -7:
-            scores["Vitória Visitante"] = min(92, scores["Vitória Visitante"] + 4)
+            scores["2 (Visitante)"] = min(92, scores["2 (Visitante)"] + 4)
+            scores["Empate Anula Visitante"] = min(93, scores["Empate Anula Visitante"] + 3)
 
         ranked = sorted(
             (BetOption(market=market, confidence=score) for market, score in scores.items()),
             key=lambda item: (-item.confidence, item.market),
         )
-        top_three = tuple(ranked[:3])
-
-        if len(top_three) < 3:
-            fallback_order = ("Over 1.5", "Ambas Marcam", "Over 2.5", "Vitória Casa", "Vitória Visitante")
-            existing = {item.market for item in top_three}
-            extra: list[BetOption] = list(top_three)
-            for market in fallback_order:
-                if market in existing:
-                    continue
-                extra.append(BetOption(market=market, confidence=60))
-                existing.add(market)
-                if len(extra) == 3:
-                    break
-            top_three = tuple(extra[:3])
+        ranked_tuple = tuple(ranked)
 
         rationale = self._build_rationale(
             home_team=home_team,
@@ -351,8 +374,8 @@ class SuggestionEngine:
         )
 
         return (
-            (top_three[0], top_three[1], top_three[2]),
-            top_three[0].confidence,
+            ranked_tuple,
+            ranked_tuple[0].confidence,
             rationale,
         )
 
@@ -399,6 +422,17 @@ class SuggestionEngine:
         if games <= 0:
             return 0.5
         return ((record["wins"] * 1.0) + (record["draws"] * 0.5)) / games
+
+    @staticmethod
+    def _draw_rate(record: dict[str, int]) -> float:
+        games = record["games"]
+        if games <= 0:
+            return 0.27
+        return record["draws"] / games
+
+    @classmethod
+    def _average_draw_rate(cls, home_record: dict[str, int], away_record: dict[str, int]) -> float:
+        return (cls._draw_rate(home_record) + cls._draw_rate(away_record)) / 2
 
     @staticmethod
     def _has_goal_signal(blob: str, threshold: str) -> bool:
@@ -454,28 +488,77 @@ class SuggestionEngine:
         over_25_probability: float | str | None,
         over_under: float | str | None,
         over_25_signal: bool,
+        equilibrium: bool,
+        draw_rate: float,
+        strength_gap: int,
     ) -> float:
         if isinstance(over_25_probability, float):
             estimate = over_25_probability
         elif isinstance(over_under, float):
             estimate = 0.54 if over_under >= 2.5 else 0.46
         else:
-            estimate = 0.5
+            estimate = 0.49
+            estimate += (0.25 - draw_rate) * 0.32
+            estimate += min(0.05, abs(strength_gap) * 0.004)
+            if equilibrium:
+                estimate -= 0.02
 
         if over_25_signal:
             estimate += 0.05
 
-        return max(0.35, min(0.82, estimate))
+        return max(0.3, min(0.82, estimate))
 
     @staticmethod
     def _estimate_over_15_probability(
         over_25_estimate: float,
         over_15_signal: bool,
+        draw_rate: float,
     ) -> float:
-        estimate = over_25_estimate + 0.18
+        estimate = over_25_estimate + 0.16
+        estimate += (0.25 - draw_rate) * 0.12
         if over_15_signal:
             estimate += 0.04
-        return max(0.55, min(0.9, estimate))
+        return max(0.45, min(0.9, estimate))
+
+    @staticmethod
+    def _estimate_draw_probability(
+        draw_probability: float | str | None,
+        equilibrium: bool,
+        home_form: float,
+        away_form: float,
+        favorite_gap: float | str | None,
+        draw_rate: float,
+    ) -> float:
+        estimate = 0.26 if equilibrium else 0.21
+        estimate += (draw_rate - 0.25) * 0.4
+        estimate -= min(0.05, abs(home_form - away_form) * 0.16)
+        if isinstance(favorite_gap, float):
+            estimate -= min(0.06, favorite_gap * 0.35)
+        if isinstance(draw_probability, float):
+            estimate = (draw_probability * 0.72) + (estimate * 0.28)
+        return max(0.12, min(0.42, estimate))
+
+    @staticmethod
+    def _estimate_under_probability(
+        under_probability: float | str | None,
+        over_estimate: float,
+    ) -> float:
+        if isinstance(under_probability, float):
+            estimate = under_probability
+        else:
+            estimate = 1.0 - over_estimate
+        return max(0.1, min(0.82, estimate))
+
+    @staticmethod
+    def _estimate_draw_no_bet_probability(
+        side_estimate: float,
+        other_side_estimate: float,
+    ) -> float:
+        total = side_estimate + other_side_estimate
+        if total <= 0:
+            return 0.5
+        estimate = side_estimate / total
+        return max(0.36, min(0.9, estimate))
 
     @staticmethod
     def _estimate_btts_probability(
@@ -483,19 +566,23 @@ class SuggestionEngine:
         equilibrium: bool,
         favorite_gap: float | str | None,
         btts_signal: bool,
+        draw_rate: float,
+        form_gap: float,
     ) -> float:
         estimate = 0.24 + (over_25_estimate * 0.52)
         if equilibrium:
             estimate += 0.08
+        estimate += (0.25 - draw_rate) * 0.16
+        estimate -= min(0.08, form_gap * 0.18)
         if isinstance(favorite_gap, float):
             estimate -= min(0.09, favorite_gap * 0.45)
         if btts_signal:
             estimate += 0.08
-        return max(0.32, min(0.78, estimate))
+        return max(0.18, min(0.78, estimate))
 
     @staticmethod
     def _to_percent(probability: float) -> int:
-        return max(35, min(93, int(round(probability * 100))))
+        return max(12, min(93, int(round(probability * 100))))
 
 
 def format_suggestion_card(suggestion: MatchSuggestion) -> str:
@@ -508,7 +595,7 @@ def format_suggestion_card(suggestion: MatchSuggestion) -> str:
         f"🏟 {suggestion.league_name}\n"
         f"⚽️ {suggestion.home_team} x {suggestion.away_team}\n"
         f"⏰ Horário: {hour}\n"
-        f"📈 Sugestões:\n{markets_text}\n"
+        f"📈 Mercados:\n{markets_text}\n"
         "ℹ️ Análise baseada em dados recentes da ESPN."
     )
 

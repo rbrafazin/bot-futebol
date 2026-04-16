@@ -16,6 +16,6 @@ class MatchSuggestion:
     home_team: str
     away_team: str
     kickoff: datetime
-    markets: tuple[BetOption, BetOption, BetOption]
+    markets: tuple[BetOption, ...]
     confidence: int
     rationale: str

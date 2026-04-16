@@ -145,7 +145,7 @@ class BetAdvisorBot:
         if include_greeting:
             greeting = (
                 "Olá! Consultei as ligas monitoradas na ESPN e separei os melhores "
-                f"jogos com 3 sugestões de aposta para {now.strftime('%d/%m/%Y')}."
+                f"jogos com os mercados ranqueados para {now.strftime('%d/%m/%Y')}."
             )
             self.telegram.send_message(chat_id=chat_id, text=greeting, reply_markup=self._refresh_keyboard())
 
