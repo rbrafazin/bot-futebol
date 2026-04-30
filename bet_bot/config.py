@@ -17,6 +17,17 @@ DEFAULT_LEAGUES = (
     "conmebol.sudamericana",
 )
 
+LEAGUE_SPORT: dict[str, str] = {
+    "nba": "basketball",
+    "wnba": "basketball",
+    "ncaam": "basketball",
+    "ncaaw": "basketball",
+}
+
+
+def get_league_sport(league_slug: str) -> str:
+    return LEAGUE_SPORT.get(league_slug, "soccer")
+
 
 def load_dotenv(dotenv_path: Path) -> None:
     if not dotenv_path.exists():

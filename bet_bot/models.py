@@ -8,6 +8,11 @@ from datetime import datetime
 class BetOption:
     market: str
     confidence: int
+    edge: int = 0
+
+    @property
+    def is_value(self) -> bool:
+        return self.edge >= 5
 
 
 @dataclass(frozen=True)
@@ -19,3 +24,4 @@ class MatchSuggestion:
     markets: tuple[BetOption, ...]
     confidence: int
     rationale: str
+    sport: str = "soccer"

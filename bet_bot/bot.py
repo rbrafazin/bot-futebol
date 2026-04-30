@@ -1,18 +1,30 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import time
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from .analysis import SuggestionEngine, format_suggestion_card, sort_and_limit
-from .config import Settings
+from .analysis import (
+    NbaSuggestionEngine,
+    SuggestionEngine,
+    format_nba_suggestion_card,
+    format_suggestion_card,
+    sort_and_limit,
+    sort_and_limit_nba,
+)
+from .config import Settings, get_league_sport
 from .espn import EspnClient
 from .http import HttpClient
+from .logging_config import get_logger, setup_logging
 from .models import MatchSuggestion
-
+from .stats import StatsTracker
 
 REFRESH_CALLBACK = "refresh_today"
+MAX_WORKERS = 4
+
+logger = setup_logging()
 
 
 class TelegramClient:
@@ -37,6 +49,7 @@ class TelegramClient:
         chat_id: int,
         text: str,
         reply_markup: dict[str, Any] | None = None,
+        parse_mode: str | None = None,
     ) -> None:
         payload: dict[str, Any] = {
             "chat_id": chat_id,
@@ -44,6 +57,8 @@ class TelegramClient:
         }
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
+        if parse_mode is not None:
+            payload["parse_mode"] = parse_mode
         self._http.post_json(self._url("sendMessage"), payload)
 
     def answer_callback_query(self, callback_query_id: str, text: str | None = None) -> None:
@@ -62,13 +77,16 @@ class BetAdvisorBot:
         settings: Settings,
         telegram_client: TelegramClient,
         espn_client: EspnClient,
-        suggestion_engine: SuggestionEngine,
+        soccer_engine: SuggestionEngine,
+        nba_engine: NbaSuggestionEngine,
     ) -> None:
         self.settings = settings
         self.telegram = telegram_client
         self.espn = espn_client
-        self.suggestion_engine = suggestion_engine
+        self.soccer_engine = soccer_engine
+        self.nba_engine = nba_engine
         self.timezone = ZoneInfo(settings.timezone)
+        self.stats_tracker = StatsTracker()
 
     @classmethod
     def from_env(cls) -> "BetAdvisorBot":
@@ -76,12 +94,13 @@ class BetAdvisorBot:
         http_client = HttpClient()
         espn_client = EspnClient(http_client=http_client, timezone_name=settings.timezone)
         telegram_client = TelegramClient(token=settings.telegram_bot_token, http_client=http_client)
-        suggestion_engine = SuggestionEngine(espn_client=espn_client)
-        return cls(settings, telegram_client, espn_client, suggestion_engine)
+        soccer_engine = SuggestionEngine(espn_client=espn_client)
+        nba_engine = NbaSuggestionEngine(espn_client=espn_client)
+        return cls(settings, telegram_client, espn_client, soccer_engine, nba_engine)
 
     def run(self) -> None:
         offset: int | None = None
-        print("Bet bot em execução. Pressione Ctrl+C para encerrar.")
+        logger.info("Bet bot iniciado. Pressione Ctrl+C para encerrar.")
 
         while True:
             try:
@@ -90,13 +109,13 @@ class BetAdvisorBot:
                     offset = update["update_id"] + 1
                     self._handle_update(update)
             except KeyboardInterrupt:
-                print("Bot encerrado.")
+                logger.info("Bot encerrado pelo usuário.")
                 return
             except TimeoutError:
                 continue
-            except Exception as exc:
-                print(f"Falha ao processar atualizações: {exc}")
-                time.sleep(3)
+            except Exception:
+                logger.exception("Falha ao processar atualizações")
+                time.sleep(5)
 
     def _handle_update(self, update: dict[str, Any]) -> None:
         if "message" in update:
@@ -113,13 +132,19 @@ class BetAdvisorBot:
         if chat_id is None:
             return
 
-        if text.startswith("/start"):
+        command = text.partition(" ")[0].lower()
+
+        if command == "/start":
             self._send_daily_suggestions(chat_id=chat_id, include_greeting=True)
+            return
+
+        if command == "/stats":
+            self._send_stats(chat_id=chat_id)
             return
 
         self.telegram.send_message(
             chat_id=chat_id,
-            text="Use /start para receber os palpites do dia.",
+            text="Comandos disponíveis:\n/start — Palpites do dia\n/stats — Histórico de palpites",
             reply_markup=self._refresh_keyboard(),
         )
 
@@ -130,13 +155,20 @@ class BetAdvisorBot:
         chat = message.get("chat") or {}
         chat_id = chat.get("id")
         if callback_id:
-            self.telegram.answer_callback_query(callback_id, text="Atualizando os palpites...")
+            try:
+                self.telegram.answer_callback_query(callback_id, text="Atualizando os palpites...")
+            except Exception:
+                logger.debug("Callback query expirado ou invalido (%s)", callback_id)
 
         if chat_id is None:
             return
 
         if data == REFRESH_CALLBACK:
             self._send_daily_suggestions(chat_id=chat_id, include_greeting=False)
+
+    def _send_stats(self, chat_id: int) -> None:
+        summary = self.stats_tracker.get_summary()
+        self.telegram.send_message(chat_id=chat_id, text=summary, parse_mode="HTML")
 
     def _send_daily_suggestions(self, chat_id: int, include_greeting: bool) -> None:
         now = datetime.now(self.timezone)
@@ -160,24 +192,43 @@ class BetAdvisorBot:
             )
             return
 
+        try:
+            self.stats_tracker.log_suggestions(suggestions)
+        except Exception:
+            logger.exception("Falha ao registrar histórico de palpites")
+
         chunks = self._chunk_cards(suggestions)
         for index, chunk in enumerate(chunks):
             keyboard = self._refresh_keyboard() if index == len(chunks) - 1 else None
-            self.telegram.send_message(chat_id=chat_id, text=chunk, reply_markup=keyboard)
+            self.telegram.send_message(chat_id=chat_id, text=chunk, reply_markup=keyboard, parse_mode="HTML")
 
     def _collect_suggestions(self, now: datetime) -> list[MatchSuggestion]:
         all_suggestions: list[MatchSuggestion] = []
-        for league_slug in self.settings.leagues:
-            try:
-                events = self.espn.fetch_games(league_slug=league_slug, target_date=now)
-                if not events:
-                    continue
-                league_suggestions = self.suggestion_engine.build_suggestions(league_slug, events)
-                all_suggestions.extend(league_suggestions)
-            except Exception as exc:
-                print(f"Liga ignorada ({league_slug}): {exc}")
+
+        with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(self.settings.leagues))) as executor:
+            future_to_league = {
+                executor.submit(self._fetch_league_suggestions, league_slug, now): league_slug
+                for league_slug in self.settings.leagues
+            }
+
+            for future in as_completed(future_to_league):
+                league_slug = future_to_league[future]
+                try:
+                    league_suggestions = future.result()
+                    all_suggestions.extend(league_suggestions)
+                except Exception:
+                    logger.exception("Liga ignorada (%s)", league_slug)
 
         return sort_and_limit(all_suggestions, limit=self.settings.suggestion_limit, now=now)
+
+    def _fetch_league_suggestions(self, league_slug: str, now: datetime) -> list[MatchSuggestion]:
+        sport = get_league_sport(league_slug)
+        events = self.espn.fetch_games(league_slug=league_slug, target_date=now, sport=sport)
+        if not events:
+            return []
+        if sport == "basketball":
+            return self.nba_engine.build_suggestions(league_slug, events)
+        return self.soccer_engine.build_suggestions(league_slug, events)
 
     def _chunk_cards(self, suggestions: list[MatchSuggestion]) -> list[str]:
         chunks: list[str] = []
@@ -185,7 +236,11 @@ class BetAdvisorBot:
         current_length = 0
 
         for suggestion in suggestions:
-            card = format_suggestion_card(suggestion)
+            card = (
+                format_nba_suggestion_card(suggestion)
+                if suggestion.sport == "basketball"
+                else format_suggestion_card(suggestion)
+            )
             projected = current_length + len(card) + (2 if current_cards else 0)
             if projected > 3500 and current_cards:
                 chunks.append("\n\n".join(current_cards))
